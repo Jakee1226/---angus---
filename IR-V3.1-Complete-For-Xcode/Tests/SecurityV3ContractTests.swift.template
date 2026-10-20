@@ -1,0 +1,235 @@
+import XCTest
+// 【B 必做】把下一行的 IR_App 換成 App 的實際 module 名稱（Target 的 Product Module Name）。
+@testable import IR_App
+
+// V3-P0 新增測試：只測「AI Context、固定說明、舊報告解碼」。
+// 規則門檻與時間窗的邊界測試（10/11 次、60 秒等）請沿用 v2 既有 XCTest；
+// 本檔有幾個斷言依賴 v2 SecurityAnalyzer 的行為，若失敗請先回報實際輸出。
+// 尚未在 Xcode 編譯或執行。
+final class SecurityV3ContractTests: XCTestCase {
+
+    // 用 JSON 解碼建立事件，避免依賴 SecurityEvent 的 init 簽名。
+    private var counter = 0
+    private func event(source: String = "TestApp", target: String, result: String = "allowed",
+                       second: Int, simulated: Bool = false) throws -> SecurityEvent {
+        counter += 1
+        let json: [String: Any] = [
+            "event_id": String(format: "E%04d", counter),
+            "timestamp": String(format: "2026-10-17T10:00:%02d+08:00", second),
+            "source": source, "action": "read", "target": target,
+            "result": result, "is_simulated": simulated
+        ]
+        let data = try JSONSerialization.data(withJSONObject: json)
+        return try JSONDecoder().decode(SecurityEvent.self, from: data)
+    }
+
+    private func context(_ events: [SecurityEvent]) throws -> SecurityAIContext {
+        SecurityAIContext.make(events: events, result: try SecurityAnalyzer.analyze(events: events))
+    }
+
+    private func sensitiveOnly() throws -> [SecurityEvent] {
+        try (0..<11).map { try event(target: "test_private_file.txt", second: $0) }
+    }
+    private func multiOnly() throws -> [SecurityEvent] {
+        try (0..<5).map { try event(target: "file_\($0).txt", second: $0) }
+    }
+    private func failureOnly() throws -> [SecurityEvent] {
+        try (0..<5).map { try event(target: "missing_\($0)", result: "failed", second: $0) }
+    }
+
+    // MARK: 來源數 vs 警示數
+    func testSameSourceThreeRulesIsThreeFindingsOneSource() throws {
+        var events = try (0..<11).map { try event(target: "test_private_file.txt", second: $0) }
+        events += try (0..<4).map { try event(target: "other_\($0).txt", second: 11 + $0) }
+        events += try (0..<5).map { try event(target: "missing_\($0)", result: "failed", second: 15 + $0) }
+        let ctx = try context(events)
+        XCTAssertEqual(ctx.triggeredFindingCount, 3)
+        XCTAssertEqual(ctx.triggeredSourceCount, 1)
+        XCTAssertEqual(ctx.triggeredRuleIDs, [SecurityRuleID.multiFileRead,
+                                              SecurityRuleID.repeatedReadFailure,
+                                              SecurityRuleID.sensitiveReadBurst].sorted())
+        XCTAssertEqual(ctx.findingFacts.count, 3)
+        let counts = Dictionary(uniqueKeysWithValues: ctx.findingFacts.map { ($0.ruleID, $0.count) })
+        XCTAssertEqual(counts[SecurityRuleID.sensitiveReadBurst], 11)
+        XCTAssertEqual(counts[SecurityRuleID.multiFileRead], 5)
+        XCTAssertEqual(counts[SecurityRuleID.repeatedReadFailure], 5)
+    }
+
+    func testOmittedFindingsWhenMoreThanLimit() throws {
+        var events: [SecurityEvent] = []
+        for s in 1...9 {
+            events += try (0..<5).map { try event(source: "Src\(s)", target: "m\($0)", result: "failed", second: $0) }
+        }
+        let ctx = try context(events)
+        XCTAssertEqual(ctx.triggeredFindingCount, 9)
+        XCTAssertEqual(ctx.triggeredSourceCount, 9)
+        XCTAssertEqual(ctx.findingFacts.count, SecurityAIContext.maximumFindingDetails)
+        XCTAssertEqual(ctx.omittedFindingCount, 1)
+    }
+
+    func testPromptJSONContainsNoRealSourceOrTarget() throws {
+        let json = try context(try sensitiveOnly()).jsonString()
+        XCTAssertFalse(json.contains("TestApp"))
+        XCTAssertFalse(json.contains("test_private_file.txt"))
+        XCTAssertTrue(json.contains("S01"))
+    }
+
+    // MARK: 舊資料相容
+    func testLegacyV2ContextDecodes() throws {
+        let legacy = """
+        {"totalEvents":20,"eligibleReads":12,"failedReads":5,"excludedEvents":3,"simulatedEvents":0,
+         "windowSeconds":60,"threshold":10,"comparison":">","triggeredSourceCount":2,
+         "omittedFindingCount":0,
+         "findingFacts":[{"sourceAlias":"S01","peakReadCount":12},{"sourceAlias":"S01","peakReadCount":5}]}
+        """
+        let ctx = try JSONDecoder().decode(SecurityAIContext.self, from: Data(legacy.utf8))
+        XCTAssertEqual(ctx.triggeredFindingCount, 2)   // v2 舊欄位其實是警示數
+        XCTAssertEqual(ctx.triggeredSourceCount, 1)    // 由 facts 的來源代號推算
+        XCTAssertEqual(ctx.findingFacts.first?.ruleID, SecurityRuleID.legacyUnknown)
+        XCTAssertEqual(ctx.findingFacts.first?.count, 12)
+        XCTAssertTrue(ctx.ruleSettings.isEmpty)
+    }
+
+    func testNewContextRoundTrip() throws {
+        let ctx = try context(try failureOnly())
+        let data = try JSONEncoder().encode(ctx)
+        XCTAssertEqual(try JSONDecoder().decode(SecurityAIContext.self, from: data), ctx)
+    }
+
+    func testReportSchemaAndRoundTrip() throws {
+        let events = try multiOnly()
+        let result = try SecurityAnalyzer.analyze(events: events)
+        let ctx = SecurityAIContext.make(events: events, result: result)
+        let report = SecurityIRReport.make(events: events, ruleResult: result, context: ctx,
+                                           explanation: SecurityRuleExplanation.make(context: ctx), notice: nil)
+        XCTAssertEqual(report.schemaVersion, "1.1")
+        let back = try JSONDecoder().decode(SecurityIRReport.self, from: try report.jsonData())
+        XCTAssertEqual(back.ruleResult.findings.count, result.findings.count)
+        XCTAssertEqual(back.context, ctx)
+    }
+
+    // MARK: 固定規則說明
+    func testExplanationNoEvents() throws {
+        let e = SecurityRuleExplanation.make(context: try context([]))
+        XCTAssertTrue(e.summary.contains("沒有可分析"))
+    }
+
+    func testExplanationNoFindingDoesNotClaimSafe() throws {
+        let events = try (0..<3).map { try event(target: "f\($0)", second: $0) }
+        let e = SecurityRuleExplanation.make(context: try context(events))
+        XCTAssertTrue(e.summary.contains("門檻"))
+        XCTAssertFalse((e.summary + e.whyItMatters).contains("安全"))
+        XCTAssertTrue(e.limits.contains("不等於全面安全"))
+    }
+
+    func testExplanationSensitiveOnly() throws {
+        let e = SecurityRuleExplanation.make(context: try context(try sensitiveOnly()))
+        XCTAssertTrue((e.summary + e.whyItMatters).contains("敏感"))
+    }
+
+    func testExplanationMultiFileOnlyDoesNotMentionSensitive() throws {
+        let e = SecurityRuleExplanation.make(context: try context(try multiOnly()))
+        let text = e.summary + e.whyItMatters + e.recommendedNextStep
+        XCTAssertTrue(text.contains("不同檔案"))
+        XCTAssertFalse(text.contains("敏感"))
+    }
+
+    func testExplanationFailureOnly() throws {
+        let e = SecurityRuleExplanation.make(context: try context(try failureOnly()))
+        let text = e.summary + e.whyItMatters
+        XCTAssertTrue(text.contains("失敗"))
+        XCTAssertFalse(text.contains("敏感"))
+    }
+
+    func testExplanationThreeRulesStatesCounts() throws {
+        var events = try (0..<11).map { try event(target: "test_private_file.txt", second: $0) }
+        events += try (0..<4).map { try event(target: "other_\($0).txt", second: 11 + $0) }
+        events += try (0..<5).map { try event(target: "missing_\($0)", result: "failed", second: 15 + $0) }
+        let e = SecurityRuleExplanation.make(context: try context(events))
+        XCTAssertTrue(e.summary.contains("3 條規則"))
+        XCTAssertTrue(e.summary.contains("1 個來源"))
+        XCTAssertTrue(e.summary.contains("3 筆警示"))
+    }
+
+    func testExplanationSimulatedWarning() throws {
+        let events = try (0..<5).map { try event(target: "m\($0)", result: "failed", second: $0, simulated: true) }
+        let e = SecurityRuleExplanation.make(context: try context(events))
+        XCTAssertTrue(e.limits.contains("模擬"))
+        XCTAssertTrue(e.limits.contains("不能當成已確認的真實攻擊"))
+    }
+
+    // MARK: AI 指示文字
+    func testInstructionsMentionAllRuleIDs() {
+        for id in [SecurityRuleID.sensitiveReadBurst, SecurityRuleID.multiFileRead, SecurityRuleID.repeatedReadFailure] {
+            XCTAssertTrue(SecurityAIInstructions.text.contains(id))
+        }
+    }
+}
+
+// MARK: - V3.1 Analyzer boundary and malformed-timestamp regression tests
+extension SecurityV3ContractTests {
+    func testTenSensitiveReadsDoNotTriggerElevenDo() throws {
+        let ten = try (0..<10).map { try event(target: "test_private_file.txt", second: $0) }
+        XCTAssertFalse(try SecurityAnalyzer.analyze(events: ten).findings.contains {
+            $0.ruleID == SecurityRuleID.sensitiveReadBurst
+        })
+        let eleven = ten + [try event(target: "test_private_file.txt", second: 10)]
+        XCTAssertTrue(try SecurityAnalyzer.analyze(events: eleven).findings.contains {
+            $0.ruleID == SecurityRuleID.sensitiveReadBurst
+        })
+    }
+
+    func testFourVsFiveDifferentFiles() throws {
+        let four = try (0..<4).map { try event(target: "unique\($0)", second: $0) }
+        XCTAssertFalse(try SecurityAnalyzer.analyze(events: four).findings.contains {
+            $0.ruleID == SecurityRuleID.multiFileRead
+        })
+        let five = four + [try event(target: "unique4", second: 4)]
+        XCTAssertTrue(try SecurityAnalyzer.analyze(events: five).findings.contains {
+            $0.ruleID == SecurityRuleID.multiFileRead
+        })
+    }
+
+    func testFourVsFiveFailures() throws {
+        let four = try (0..<4).map { try event(target: "missing", result: "failed", second: $0) }
+        XCTAssertFalse(try SecurityAnalyzer.analyze(events: four).findings.contains {
+            $0.ruleID == SecurityRuleID.repeatedReadFailure
+        })
+        let five = four + [try event(target: "missing", result: "failed", second: 4)]
+        XCTAssertTrue(try SecurityAnalyzer.analyze(events: five).findings.contains {
+            $0.ruleID == SecurityRuleID.repeatedReadFailure
+        })
+    }
+
+    func testBadTimestampIsSkippedAndReported() throws {
+        let good = try (0..<11).map { try event(target: "test_private_file.txt", second: $0) }
+        let bad = try event(target: "test_private_file.txt", second: 11)
+        // Build JSON to change only the timestamp without requiring SecurityEvent memberwise init.
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(bad)) as? [String: Any])
+        object["timestamp"] = "not-a-date"
+        let malformed = try JSONDecoder().decode(SecurityEvent.self, from: JSONSerialization.data(withJSONObject: object))
+        let result = try SecurityAnalyzer.analyze(events: good + [malformed])
+        XCTAssertEqual(result.invalidTimestampCount, 1)
+        XCTAssertEqual(result.totalEvents, 12)
+        XCTAssertTrue(result.findings.contains { $0.ruleID == SecurityRuleID.sensitiveReadBurst })
+        XCTAssertEqual(try JSONDecoder().decode(SecurityAnalysisResult.self, from: JSONEncoder().encode(result)).invalidTimestampCount, 1)
+    }
+
+    func testExactlySixtySecondsIncludedAndOutOfOrder() throws {
+        // Five failed reads at t=0, 10, 20, 30, 60 should trigger; t=60.001 instead should not.
+        func make(_ ts: String, _ suffix: String) throws -> SecurityEvent {
+            let data: [String: Any] = ["event_id": suffix, "timestamp": ts, "source": "Boundary",
+                "action": "read", "target": "missing", "result": "failed", "is_simulated": true]
+            return try JSONDecoder().decode(SecurityEvent.self, from: JSONSerialization.data(withJSONObject: data))
+        }
+        let prefix = try ["00", "10", "20", "30"].map { try make("2026-10-17T10:00:\($0)+08:00", "B\($0)") }
+        let at60 = try make("2026-10-17T10:01:00+08:00", "B60")
+        let after60 = try make("2026-10-17T10:01:00.001+08:00", "B601")
+        XCTAssertTrue(try SecurityAnalyzer.analyze(events: [at60] + prefix.reversed()).findings.contains {
+            $0.ruleID == SecurityRuleID.repeatedReadFailure
+        })
+        XCTAssertFalse(try SecurityAnalyzer.analyze(events: prefix + [after60]).findings.contains {
+            $0.ruleID == SecurityRuleID.repeatedReadFailure
+        })
+    }
+}
